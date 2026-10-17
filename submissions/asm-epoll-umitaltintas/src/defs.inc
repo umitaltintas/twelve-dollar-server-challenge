@@ -31,7 +31,9 @@
 %define SQLITE_DONE       101
 
 ; Sizes
+%ifndef MAXCONN
 %define MAXCONN           65536          ; fds are below LimitNOFILE=65535
+%endif
 %ifndef KA_PER_IP
 %define KA_PER_IP         20000          ; keep-alive budget per client address (bucket)
 %endif

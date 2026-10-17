@@ -143,7 +143,11 @@ sql_like:    db 'INSERT INTO likes(user_id,post_id) SELECT ?1,?2 '
              db 'WHERE EXISTS(SELECT 1 FROM posts WHERE id=?2) ON CONFLICT DO NOTHING', 0
 sql_exists:  db 'SELECT 1 FROM posts WHERE id=?1', 0
 sql_one:     db 'SELECT 1', 0
+%ifdef UNLEASHED
+sql_begin:   db 'BEGIN IMMEDIATE', 0   ; several processes write: take the write lock up front
+%else
 sql_begin:   db 'BEGIN', 0
+%endif
 sql_commit:  db 'COMMIT', 0
 sql_rollback: db 'ROLLBACK', 0
 sql_warm:    db 'SELECT count(*) FROM posts INDEXED BY posts_created_at_id_idx;'
@@ -400,6 +404,14 @@ net_init:
   lea r10, [one]
   mov r8d, 4
   SYSCALL SYS_setsockopt
+%ifdef UNLEASHED
+  mov edi, [lfd]
+  mov esi, 1                  ; SOL_SOCKET
+  mov edx, 15                 ; SO_REUSEPORT: several processes share the port (experiment only)
+  lea r10, [one]
+  mov r8d, 4
+  SYSCALL SYS_setsockopt
+%endif
   mov edi, [lfd]
   lea rsi, [sockaddr]
   mov edx, 16
