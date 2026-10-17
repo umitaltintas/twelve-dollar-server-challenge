@@ -89,5 +89,6 @@ change is not in this branch.
 
 The fix that keeps group commit is a single writer: one process owns all writes and commits them
 in batches, and the others only read. That needs a queue between processes, and a way to send
-each write's response back on the right connection. I haven't built it. The load where it would
-matter (around 384k) is beyond what I can generate on my laptop, so I couldn't measure it anyway.
+each write's response back on the right connection. It is built, in C, in
+[`../c-single-writer`](../c-single-writer/README.md): on the same three cores it passes 384k, where
+the processes here fail.
