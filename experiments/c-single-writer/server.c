@@ -30,6 +30,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -70,12 +71,21 @@ typedef struct job {
   int status;        // result: 200, 201, 404, 500, or -1 if the transaction did not commit
   int64_t uid, pid, id;
   int clen, nlen, blen;
+  int widx;          // process mode, writer side: the reader the job came from
+  uint64_t cookie;   // process mode, writer side: the reader's job pointer
   char created[40];
   char data[];       // username, then body
 } job;
 
+// Process mode messages (SOCK_SEQPACKET, one reader process <-> the writer process)
+typedef struct { uint64_t cookie; int32_t kind, close; int64_t uid, pid; int32_t nlen, blen; } wreq;
+typedef struct { uint64_t cookie; int32_t status, clen; int64_t id; char created[40]; } wres;
+#define RES_PER_MSG 1024
+
 struct worker {
   int id, epfd, lfd, evfd, accept_off;
+  int wsock;                   // process mode: socket to the writer process
+  char msg[16384];             // process mode: one outgoing job
   _Atomic(job *) done;         // results from the writer
   sqlite3 *db;
   sqlite3_stmt *st_feed, *st_post, *st_one;
@@ -730,7 +740,21 @@ static int h_health(worker *w) {
   return 0;
 }
 
+static int proc_mode;  // PROCS=1: readers are processes and talk to the writer over sockets
+
 static void writer_push(job *j) {
+  if (proc_mode) {
+    worker *w = j->w;
+    wreq r = {(uint64_t)(uintptr_t)j, j->kind, j->close, j->uid, j->pid, j->nlen, j->blen};
+    memcpy(w->msg, &r, sizeof r);
+    memcpy(w->msg + sizeof r, j->data, j->nlen + j->blen);
+    // blocking send: if the writer falls behind, this reader waits (back-pressure)
+    if (send(w->wsock, w->msg, sizeof r + j->nlen + j->blen, MSG_NOSIGNAL) < 0) {
+      perror("send to writer");
+      exit(1);
+    }
+    return;
+  }
   job *old = atomic_load_explicit(&wq, memory_order_relaxed);
   do j->next = old;
   while (!atomic_compare_exchange_weak_explicit(&wq, &old, j, memory_order_release, memory_order_relaxed));
@@ -1076,62 +1100,97 @@ static void *ckpt_main(void *arg) {
 }
 
 static sqlite3 *wdb;
+static sqlite3_stmt *st_ins, *st_like, *st_exists, *st_begin, *st_commit;
+static long gap_us;
+static struct timespec last_batch;
 
+static void writer_init(void) {
+  st_ins = prep(wdb, "INSERT INTO posts(user_id,body) VALUES(?1,?2) RETURNING id,created_at");
+  st_like = prep(wdb, "INSERT INTO likes(user_id,post_id) SELECT ?1,?2 "
+                      "WHERE EXISTS(SELECT 1 FROM posts WHERE id=?2) ON CONFLICT DO NOTHING");
+  st_exists = prep(wdb, "SELECT 1 FROM posts WHERE id=?1");
+  st_begin = prep(wdb, "BEGIN IMMEDIATE");
+  st_commit = prep(wdb, "COMMIT");
+  // Every commit makes each reader drop its page cache and unmap the database on its next read
+  // (SQLite does that when it sees the WAL has changed). COMMIT_GAP_US spaces commits out so
+  // that happens less often; writes wait up to that long for their batch.
+  const char *g = getenv("COMMIT_GAP_US");
+  gap_us = g ? atol(g) : 0;
+}
+
+// wait until at least gap_us has passed since the previous batch started
+static void writer_gap(void) {
+  if (gap_us <= 0) return;
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  long since = (now.tv_sec - last_batch.tv_sec) * 1000000L + (now.tv_nsec - last_batch.tv_nsec) / 1000;
+  if (since < gap_us) usleep(gap_us - since);
+  clock_gettime(CLOCK_MONOTONIC, &last_batch);
+}
+
+// run a list of jobs in one transaction and set each one's status
+static void run_batch(job *fifo) {
+  int ok = sqlite3_step(st_begin) == SQLITE_DONE;
+  sqlite3_reset(st_begin);
+  for (job *j = fifo; j; j = j->next) {
+    j->status = 500;
+    if (!ok) continue;
+    if (j->kind == 1) {
+      sqlite3_bind_int64(st_ins, 1, j->uid);
+      sqlite3_bind_text(st_ins, 2, j->data + j->nlen, j->blen, SQLITE_STATIC);
+      if (sqlite3_step(st_ins) == SQLITE_ROW) {
+        j->id = sqlite3_column_int64(st_ins, 0);
+        int n = sqlite3_column_bytes(st_ins, 1);
+        if (n > (int)sizeof j->created) n = sizeof j->created;
+        memcpy(j->created, sqlite3_column_text(st_ins, 1), n);
+        j->clen = n;
+        j->status = 201;
+      }
+      sqlite3_reset(st_ins);
+    } else {
+      sqlite3_bind_int64(st_like, 1, j->uid);
+      sqlite3_bind_int64(st_like, 2, j->pid);
+      int rc = sqlite3_step(st_like);
+      sqlite3_reset(st_like);
+      if (rc != SQLITE_DONE) continue;
+      if (sqlite3_changes(wdb)) { j->status = 201; continue; }
+      sqlite3_bind_int64(st_exists, 1, j->pid);
+      rc = sqlite3_step(st_exists);
+      sqlite3_reset(st_exists);
+      if (rc == SQLITE_ROW) j->status = 200;
+      else if (rc == SQLITE_DONE) j->status = 404;
+    }
+  }
+  if (ok) {
+    int rc = sqlite3_step(st_commit);
+    sqlite3_reset(st_commit);
+    if (rc != SQLITE_DONE) {
+      sqlite3_exec(wdb, "ROLLBACK", NULL, NULL, NULL);
+      for (job *j = fifo; j; j = j->next) j->status = -1;
+    }
+  }
+}
+
+static void writer_ckpt(void) {
+  if (atomic_load_explicit(&wal_frames, memory_order_relaxed) >= CKPT_MAIN_FRAMES) {
+    atomic_store_explicit(&wal_frames, 0, memory_order_relaxed);
+    sqlite3_wal_checkpoint_v2(wdb, NULL, SQLITE_CHECKPOINT_PASSIVE, NULL, NULL);
+  }
+}
+
+// thread mode: jobs come through the lock-free stack, results go back the same way
 static void *writer_main(void *arg) {
   (void)arg;
-  sqlite3_stmt *st_ins = prep(wdb, "INSERT INTO posts(user_id,body) VALUES(?1,?2) RETURNING id,created_at");
-  sqlite3_stmt *st_like = prep(wdb, "INSERT INTO likes(user_id,post_id) SELECT ?1,?2 "
-                                    "WHERE EXISTS(SELECT 1 FROM posts WHERE id=?2) ON CONFLICT DO NOTHING");
-  sqlite3_stmt *st_exists = prep(wdb, "SELECT 1 FROM posts WHERE id=?1");
-  sqlite3_stmt *st_begin = prep(wdb, "BEGIN IMMEDIATE");
-  sqlite3_stmt *st_commit = prep(wdb, "COMMIT");
   job **heads = calloc(nworkers, sizeof *heads), **tails = calloc(nworkers, sizeof *tails);
   for (;;) {
     uint64_t v;
     if (read(wq_evfd, &v, 8) < 0 && errno == EINTR) continue;
+    writer_gap();
     job *list = atomic_exchange_explicit(&wq, NULL, memory_order_acquire);
     if (!list) continue;
     job *fifo = NULL;  // the stack is newest first
     while (list) { job *n = list->next; list->next = fifo; fifo = list; list = n; }
-    int ok = sqlite3_step(st_begin) == SQLITE_DONE;
-    sqlite3_reset(st_begin);
-    for (job *j = fifo; j; j = j->next) {
-      j->status = 500;
-      if (!ok) continue;
-      if (j->kind == 1) {
-        sqlite3_bind_int64(st_ins, 1, j->uid);
-        sqlite3_bind_text(st_ins, 2, j->data + j->nlen, j->blen, SQLITE_STATIC);
-        if (sqlite3_step(st_ins) == SQLITE_ROW) {
-          j->id = sqlite3_column_int64(st_ins, 0);
-          int n = sqlite3_column_bytes(st_ins, 1);
-          if (n > (int)sizeof j->created) n = sizeof j->created;
-          memcpy(j->created, sqlite3_column_text(st_ins, 1), n);
-          j->clen = n;
-          j->status = 201;
-        }
-        sqlite3_reset(st_ins);
-      } else {
-        sqlite3_bind_int64(st_like, 1, j->uid);
-        sqlite3_bind_int64(st_like, 2, j->pid);
-        int rc = sqlite3_step(st_like);
-        sqlite3_reset(st_like);
-        if (rc != SQLITE_DONE) continue;
-        if (sqlite3_changes(wdb)) { j->status = 201; continue; }
-        sqlite3_bind_int64(st_exists, 1, j->pid);
-        rc = sqlite3_step(st_exists);
-        sqlite3_reset(st_exists);
-        if (rc == SQLITE_ROW) j->status = 200;
-        else if (rc == SQLITE_DONE) j->status = 404;
-      }
-    }
-    if (ok) {
-      int rc = sqlite3_step(st_commit);
-      sqlite3_reset(st_commit);
-      if (rc != SQLITE_DONE) {
-        sqlite3_exec(wdb, "ROLLBACK", NULL, NULL, NULL);
-        for (job *j = fifo; j; j = j->next) j->status = -1;
-      }
-    }
+    run_batch(fifo);
     // hand the results back, one chain and one wakeup per reader
     for (job *j = fifo, *n; j; j = n) {
       n = j->next;
@@ -1152,12 +1211,68 @@ static void *writer_main(void *arg) {
         (void)!write(w->evfd, &one, 8);
       }
     }
-    if (atomic_load_explicit(&wal_frames, memory_order_relaxed) >= CKPT_MAIN_FRAMES) {
-      atomic_store_explicit(&wal_frames, 0, memory_order_relaxed);
-      sqlite3_wal_checkpoint_v2(wdb, NULL, SQLITE_CHECKPOINT_PASSIVE, NULL, NULL);
-    }
+    writer_ckpt();
   }
   return NULL;
+}
+
+// process mode: the writer process reads jobs from every reader's socket and answers each
+// reader with one message of results per batch
+static void writer_proc_main(int *socks) {
+  int ep = epoll_create1(0);
+  for (int i = 0; i < nworkers; i++) {
+    struct epoll_event e = {.events = EPOLLIN, .data.u32 = i};
+    epoll_ctl(ep, EPOLL_CTL_ADD, socks[i], &e);
+  }
+  struct epoll_event evs[64];
+  char *buf = malloc(65536);
+  wres *res = malloc(RES_PER_MSG * sizeof *res);
+  for (;;) {
+    if (epoll_wait(ep, evs, 64, -1) <= 0) continue;
+    writer_gap();
+    job *fifo = NULL, *tail = NULL;
+    for (int i = 0; i < nworkers; i++) {
+      for (;;) {
+        ssize_t n = recv(socks[i], buf, 65536, MSG_DONTWAIT);
+        if (n == 0) { fputs("a reader process exited\n", stderr); exit(1); }
+        if (n < 0) break;
+        wreq r;
+        memcpy(&r, buf, sizeof r);
+        job *j = malloc(sizeof(job) + r.nlen + r.blen);
+        j->next = NULL;
+        j->widx = i;
+        j->cookie = r.cookie;
+        j->kind = r.kind;
+        j->uid = r.uid;
+        j->pid = r.pid;
+        j->nlen = r.nlen;
+        j->blen = r.blen;
+        j->clen = 0;
+        j->id = 0;
+        memcpy(j->data, buf + sizeof r, r.nlen + r.blen);
+        if (tail) tail->next = j; else fifo = j;
+        tail = j;
+      }
+    }
+    if (!fifo) continue;
+    run_batch(fifo);
+    for (int i = 0; i < nworkers; i++) {
+      int k = 0;
+      for (job *j = fifo; j; j = j->next) {
+        if (j->widx != i) continue;
+        wres *r = &res[k++];
+        r->cookie = j->cookie;
+        r->status = j->status;
+        r->clen = j->clen;
+        r->id = j->id;
+        memcpy(r->created, j->created, sizeof r->created);
+        if (k == RES_PER_MSG) { (void)!send(socks[i], res, k * sizeof *res, MSG_NOSIGNAL); k = 0; }
+      }
+      if (k) (void)!send(socks[i], res, k * sizeof *res, MSG_NOSIGNAL);
+    }
+    for (job *j = fifo, *n; j; j = n) { n = j->next; free(j); }
+    writer_ckpt();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1165,8 +1280,13 @@ static void *writer_main(void *arg) {
 
 static void *worker_main(void *arg) {
   worker *w = arg;
-  w->db = db_open("PRAGMA mmap_size=1073741824;PRAGMA cache_size=-8000;PRAGMA temp_store=MEMORY;"
-                  "PRAGMA busy_timeout=5000;PRAGMA query_only=1;");
+  // READER_MMAP=0 makes readers use pread instead of mmap (no unmapping when the WAL changes)
+  const char *mm = getenv("READER_MMAP");
+  char pragmas[256];
+  snprintf(pragmas, sizeof pragmas,
+           "PRAGMA mmap_size=%lld;PRAGMA cache_size=-8000;PRAGMA temp_store=MEMORY;"
+           "PRAGMA busy_timeout=5000;PRAGMA query_only=1;", mm ? atoll(mm) : 1073741824LL);
+  w->db = db_open(pragmas);
   w->st_feed = prep(w->db, POST_COLS "ORDER BY p.created_at DESC,p.id DESC LIMIT 20");
   w->st_post = prep(w->db, POST_COLS "WHERE p.id=?1");
   w->st_one = prep(w->db, "SELECT 1");
@@ -1182,10 +1302,11 @@ static void *worker_main(void *arg) {
   w->epfd = epoll_create1(0);
   struct epoll_event e = {.events = EPOLLIN, .data.fd = w->lfd};
   epoll_ctl(w->epfd, EPOLL_CTL_ADD, w->lfd, &e);
-  e.data.fd = w->evfd;
-  epoll_ctl(w->epfd, EPOLL_CTL_ADD, w->evfd, &e);
+  e.data.fd = proc_mode ? w->wsock : w->evfd;  // where results from the writer arrive
+  epoll_ctl(w->epfd, EPOLL_CTL_ADD, e.data.fd, &e);
 
   struct epoll_event *evs = malloc(MAXEV * sizeof *evs);
+  wres *res = proc_mode ? malloc(RES_PER_MSG * sizeof *res) : NULL;
   for (;;) {
     int n = epoll_wait(w->epfd, evs, MAXEV, -1);
     if (n <= 0) continue;
@@ -1201,6 +1322,22 @@ static void *worker_main(void *arg) {
         (void)!read(w->evfd, &v, 8);
         job *j = atomic_exchange_explicit(&w->done, NULL, memory_order_acquire);
         while (j) { job *next = j->next; complete(w, j); j = next; }
+        continue;
+      }
+      if (proc_mode && fd == w->wsock) {
+        for (;;) {
+          ssize_t m = recv(w->wsock, res, RES_PER_MSG * sizeof *res, MSG_DONTWAIT);
+          if (m == 0) { fputs("the writer process exited\n", stderr); exit(1); }
+          if (m < 0) break;
+          for (size_t k = 0; k < (size_t)m / sizeof *res; k++) {
+            job *j = (job *)(uintptr_t)res[k].cookie;
+            j->status = res[k].status;
+            j->clen = res[k].clen;
+            j->id = res[k].id;
+            memcpy(j->created, res[k].created, sizeof j->created);
+            complete(w, j);
+          }
+        }
         continue;
       }
       conn *c = &conns[fd];
@@ -1249,6 +1386,45 @@ int main(void) {
   listen_addr.sin_port = htons(port ? atoi(port) : 3000);
 
   sqlite3_initialize();
+  const char *th = getenv("THREADS");
+  nworkers = th ? atoi(th) : ncpus();
+  if (nworkers < 1) nworkers = 1;
+  workers = calloc(nworkers, sizeof *workers);
+  for (int i = 0; i < nworkers; i++) {
+    workers[i] = calloc(1, sizeof(worker));
+    workers[i]->id = i;
+    workers[i]->evfd = -1;
+  }
+
+  const char *pm = getenv("PROCS");
+  proc_mode = pm && atoi(pm) > 0;
+  int *socks = NULL;
+  if (proc_mode) {
+    // Fork the readers before this process opens the database: an SQLite connection must not
+    // be carried across fork(). Each reader is single-threaded with its own address space.
+    socks = calloc(nworkers, sizeof *socks);
+    for (int i = 0; i < nworkers; i++) {
+      int sv[2], big = 4 << 20;
+      if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv)) { perror("socketpair"); return 1; }
+      for (int k = 0; k < 2; k++) {
+        setsockopt(sv[k], SOL_SOCKET, SO_SNDBUF, &big, sizeof big);
+        setsockopt(sv[k], SOL_SOCKET, SO_RCVBUF, &big, sizeof big);
+      }
+      pid_t pid = fork();
+      if (pid < 0) { perror("fork"); return 1; }
+      if (pid == 0) {
+        prctl(PR_SET_PDEATHSIG, SIGKILL);
+        close(sv[0]);
+        for (int k = 0; k < i; k++) close(socks[k]);
+        workers[i]->wsock = sv[1];
+        worker_main(workers[i]);
+        return 0;
+      }
+      close(sv[1]);
+      socks[i] = sv[0];
+    }
+  }
+
   wdb = db_open("PRAGMA journal_mode=WAL;PRAGMA synchronous=NORMAL;PRAGMA mmap_size=1073741824;"
                 "PRAGMA cache_size=-8000;PRAGMA temp_store=MEMORY;PRAGMA busy_timeout=5000;"
                 "PRAGMA wal_autocheckpoint=0;PRAGMA journal_size_limit=67108864;");
@@ -1258,18 +1434,16 @@ int main(void) {
                     "SELECT count(*) FROM likes INDEXED BY likes_post_id_idx;"
                     "SELECT count(*) FROM users;", NULL, NULL, NULL);
 
-  const char *th = getenv("THREADS");
-  nworkers = th ? atoi(th) : ncpus();
-  if (nworkers < 1) nworkers = 1;
-  workers = calloc(nworkers, sizeof *workers);
-  for (int i = 0; i < nworkers; i++) {
-    workers[i] = calloc(1, sizeof(worker));
-    workers[i]->id = i;
-    workers[i]->evfd = eventfd(0, EFD_NONBLOCK);
-  }
-  wq_evfd = eventfd(0, 0);  // blocking: the writer sleeps on it
-
+  writer_init();
   pthread_t t;
+  if (proc_mode) {
+    pthread_create(&t, NULL, ckpt_main, NULL);
+    fprintf(stderr, "c single-writer server: %d reader processes\n", nworkers);
+    writer_proc_main(socks);
+    return 0;
+  }
+  for (int i = 0; i < nworkers; i++) workers[i]->evfd = eventfd(0, EFD_NONBLOCK);
+  wq_evfd = eventfd(0, 0);  // blocking: the writer sleeps on it
   pthread_create(&t, NULL, writer_main, NULL);
   pthread_create(&t, NULL, ckpt_main, NULL);
   for (int i = 1; i < nworkers; i++) pthread_create(&t, NULL, worker_main, workers[i]);

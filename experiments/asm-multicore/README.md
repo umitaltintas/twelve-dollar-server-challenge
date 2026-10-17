@@ -90,5 +90,5 @@ change is not in this branch.
 The fix that keeps group commit is a single writer: one process owns all writes and commits them
 in batches, and the others only read. That needs a queue between processes, and a way to send
 each write's response back on the right connection. It is built, in C, in
-[`../c-single-writer`](../c-single-writer/README.md): on the same three cores it passes 384k, where
-the processes here fail.
+[`../c-single-writer`](../c-single-writer/README.md). On the same three cores it passes 384k, where
+the processes here fail, and with two settings it passes 512k.
